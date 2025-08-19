@@ -332,6 +332,41 @@ impl ProxyHttp for ExampleProxyHttp {
     ) -> Result<()> {
         connected_to_upstream_common(reused, digest, ctx)
     }
+
+    #[cfg(feature = "forward")]
+    async fn connect_request_filter(
+        &self,
+        session: &mut Session,
+        destination: &pingora_core::protocols::http::connect_tunnel::ConnectDestination,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Box<HttpPeer>>> {
+        let req = session.req_header();
+
+        if let Some(allow_header) = req.headers.get("x-connect-allow") {
+            if let Ok(allowed_dest) = allow_header.to_str() {
+                if allowed_dest == destination.to_string() {
+                    // Return a peer to connect to the destination
+                    return Ok(Some(Box::new(HttpPeer::new(
+                        destination.to_string(),
+                        false,
+                        "".to_string(),
+                    ))));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "forward")]
+    async fn connect_tunnel_established(
+        &self,
+        _session: &mut Session,
+        _destination: &pingora_core::protocols::http::connect_tunnel::ConnectDestination,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        // Log that tunnel was established
+        Ok(())
+    }
 }
 
 static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);

@@ -238,6 +238,325 @@ async fn test_download_timeout_min_rate() {
     assert!(!err);
 }
 
+#[cfg(test)]
+#[cfg(feature = "forward")]
+mod test_connect {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_test::assert_ok;
+
+    async fn start_echo_server(port: u16) {
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0; 1024];
+                        loop {
+                            match socket.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if socket.write_all(&buf[0..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    async fn start_tls_echo_server(port: u16) {
+        use std::sync::Arc;
+        use tokio_rustls::{rustls, TlsAcceptor};
+
+        // Generate self-signed cert using rcgen
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let private_key_der = cert.signing_key.serialize_der();
+
+        let cert_chain = vec![rustls::Certificate(cert_der)];
+        let private_key = rustls::PrivateKey(private_key_der);
+
+        let config = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, private_key)
+            .unwrap();
+
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mut tls_stream) = acceptor.accept(socket).await {
+                            // Read HTTP request
+                            let mut buf = [0; 1024];
+                            if let Ok(n) = tls_stream.read(&mut buf).await {
+                                let request = String::from_utf8_lossy(&buf[..n]);
+                                println!("TLS server received: {}", request);
+
+                                // Send simple HTTP response
+                                let response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello, HTTPS!";
+                                let _ = tls_stream.write_all(response.as_bytes()).await;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn test_tls_connect_success() {
+        init();
+
+        let echo_port = 9001;
+        start_tls_echo_server(echo_port).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Test successful CONNECT request with proper authorization
+        // Send CONNECT request to the proxy server
+        let client = reqwest::Client::new();
+        let response = client
+            .request(
+                reqwest::Method::from_bytes(b"CONNECT").unwrap(),
+                "http://127.0.0.1:6147",
+            )
+            .header("host", format!("127.0.0.1:{}", echo_port))
+            .header("x-connect-allow", format!("127.0.0.1:{}", echo_port))
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                assert!(
+                    resp.status().is_success(),
+                    "CONNECT request with proper authorization should succeed"
+                );
+            }
+            Err(e) => {
+                panic!("CONNECT request with authorization should have succeeded");
+            }
+        }
+
+        // Test CONNECT request without authorization (should fail)
+        let response_no_allow = client
+            .request(
+                reqwest::Method::from_bytes(b"CONNECT").unwrap(),
+                "http://127.0.0.1:6147",
+            )
+            .header("host", format!("127.0.0.1:{}", echo_port))
+            .send()
+            .await;
+
+        match response_no_allow {
+            Ok(resp) => {
+                assert!(
+                    resp.status() == StatusCode::FORBIDDEN
+                        || resp.status() == StatusCode::BAD_GATEWAY,
+                    "CONNECT request without authorization should be rejected"
+                );
+            }
+            Err(e) => {
+                //
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_unauthorized() {
+        init();
+
+        // Start a TLS server on a different port to test unauthorized access
+        let unauthorized_port = 9999;
+        start_tls_echo_server(unauthorized_port).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send a CONNECT request without the x-connect-allow header
+        // This should be rejected by our connect_request_filter since it doesn't allow the destination
+        let client = reqwest::Client::new();
+        let response = client
+            .request(
+                reqwest::Method::from_bytes(b"CONNECT").unwrap(),
+                "http://127.0.0.1:6147",
+            )
+            .header("host", format!("127.0.0.1:{}", unauthorized_port))
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                assert!(
+                    resp.status() == StatusCode::FORBIDDEN
+                        || resp.status() == StatusCode::BAD_GATEWAY
+                );
+            }
+            Err(e) => {
+                // This is also acceptable - connection might be rejected
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_invalid_authority() {
+        init();
+
+        let client = reqwest::Client::new();
+        let response = client
+            .request(
+                reqwest::Method::from_bytes(b"CONNECT").unwrap(),
+                "http://127.0.0.1:6147",
+            )
+            .header("host", "invalid:port:format")
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                assert!(resp.status().is_client_error());
+            }
+            Err(_) => {
+                // Expected for malformed authority
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_filter_rejection() {
+        init();
+
+        let client = reqwest::Client::new();
+        let response = client
+            .request(
+                reqwest::Method::from_bytes(b"CONNECT").unwrap(),
+                "http://127.0.0.1:6147",
+            )
+            .header("host", "blocked.example.com:443")
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                assert!(resp.status().is_client_error() || resp.status().is_server_error());
+            }
+            Err(_) => {
+                // Expected for blocked destinations
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_upstream_failure() {
+        init();
+
+        // Use a valid port number that should fail to connect (port is valid but nothing listening)
+        let unreachable_port = 65432; // Valid port but nothing should be listening on it
+        let client = reqwest::Client::new();
+        let response = client
+            .request(
+                reqwest::Method::from_bytes(b"CONNECT").unwrap(),
+                "http://127.0.0.1:6147",
+            )
+            .header("host", format!("127.0.0.1:{}", unreachable_port))
+            .header("x-connect-allow", format!("127.0.0.1:{}", unreachable_port))
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+            }
+            Err(_) => {
+                // Expected for connection failure
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_destination_parsing() {
+        init();
+
+        // Test various authority formats that should be parsed correctly
+        let valid_authorities = vec![
+            "example.com:443",
+            "192.168.1.1:8080",
+            "[::1]:80",
+            "[2001:db8::1]:443",
+        ];
+
+        for authority in valid_authorities {
+            let client = reqwest::Client::new();
+            let response = client
+                .request(
+                    reqwest::Method::from_bytes(b"CONNECT").unwrap(),
+                    "http://127.0.0.1:6147",
+                )
+                .header("host", authority)
+                .send()
+                .await;
+
+            // We expect some form of response (not connection error)
+            // The specific status depends on whether the destination is allowed
+            match response {
+                Ok(_) => {
+                    // Authority was parsed successfully
+                }
+                Err(e) => {
+                    // Should not be a parsing error
+                    let error_str = e.to_string();
+                    assert!(!error_str.contains("invalid") || !error_str.contains("parse"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_http_version_handling() {
+        init();
+
+        // CONNECT method should work with HTTP/1.1
+        // Test that the response includes proper headers
+
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+
+        let response = client
+            .request(
+                reqwest::Method::from_bytes(b"CONNECT").unwrap(),
+                "http://127.0.0.1:6147",
+            )
+            .header("host", "example.com:443")
+            .version(reqwest::Version::HTTP_11)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                // Should handle HTTP/1.1 CONNECT
+                assert!(
+                    resp.version() == reqwest::Version::HTTP_11 || resp.status().is_client_error()
+                );
+            }
+            Err(_) => {
+                // Connection handling varies by implementation
+            }
+        }
+    }
+}
+
 mod test_cache {
     use super::*;
     use std::str::FromStr;

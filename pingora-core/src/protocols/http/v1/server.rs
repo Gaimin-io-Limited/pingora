@@ -17,6 +17,7 @@
 use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::uri::Authority;
 use http::HeaderValue;
 use http::{header, header::AsHeaderName, Method, Version};
 use log::{debug, warn};
@@ -81,6 +82,8 @@ pub struct HttpSession {
     ignore_info_resp: bool,
     /// Disable keepalive if response is sent before downstream body is finished
     close_on_response_before_downstream_finish: bool,
+    /// When this is true, the request is a CONNECT request and will invoke different processing.
+    is_connect: bool,
 }
 
 impl HttpSession {
@@ -119,6 +122,7 @@ impl HttpSession {
             min_send_rate: None,
             ignore_info_resp: false,
             close_on_response_before_downstream_finish: false,
+            is_connect: false,
         }
     }
 
@@ -267,6 +271,7 @@ impl HttpSession {
                         self.response_written = None;
                         self.respect_keepalive();
                         self.validate_request()?;
+                        self.validate_connect_request()?;
 
                         return Ok(Some(s));
                     }
@@ -398,6 +403,59 @@ impl HttpSession {
             }
             bytes
         }))
+    }
+
+    fn validate_connect_request(&mut self) -> Result<()> {
+        let request_header = self.request_header.as_ref().unwrap();
+
+        if request_header.method != Method::CONNECT {
+            return Ok(());
+        }
+        self.is_connect = true;
+
+        // CONNECT method must have authority in URI
+        let uri = &request_header.uri;
+        let uri_str = uri.to_string();
+
+        // for CONNECT, the URI should be just authority (host:port)
+        if !AUTHORITY_REGEX.is_match(uri_str.as_bytes()) {
+            return Error::e_explain(
+                InvalidHTTPHeader,
+                "CONNECT request URI must be an authority (host:port)",
+            );
+        }
+
+        // for CONNECT requests, manually set some values in the request header
+        match uri.authority() {
+            None => match Authority::try_from(uri_str) {
+                Ok(v) => {
+                    let mut parts = uri.clone().into_parts();
+                    parts.authority = Some(v);
+                    parts.scheme = Some(http::uri::Scheme::HTTP); // irrelevant but needed for Uri::from_parts
+                    match http::Uri::from_parts(parts) {
+                        Ok(v) => {
+                            // update the request header with the authority
+                            match self.request_header.as_deref_mut() {
+                                None => Error::e_explain(
+                                    InvalidHTTPHeader,
+                                    "CONNECT request header is not read yet",
+                                ),
+                                Some(rh) => {
+                                    rh.set_uri(v);
+                                    Ok(())
+                                }
+                            }
+                        }
+                        Err(e) => Error::e_explain(InvalidHTTPHeader, e.to_string()),
+                    }
+                }
+                Err(e) => Error::e_explain(
+                    InvalidHTTPHeader,
+                    format!("CONNECT request URI is invalid: {e}"),
+                ),
+            },
+            Some(_) => Ok(()),
+        }
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
@@ -1113,6 +1171,11 @@ impl HttpSession {
 // Regex to parse request line that has illegal chars in it
 static REQUEST_LINE_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^\w+ (?P<uri>.+) HTTP/\d(?:\.\d)?").unwrap());
+
+// Regex to match authority in request line
+// matches host or [IPv6] with optional :port, no path/query
+static AUTHORITY_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^[^\s:]+(?::[1-9]\d{0,4})?$").unwrap());
 
 // the chars httparse considers illegal in URL
 // Almost https://url.spec.whatwg.org/#query-percent-encode-set + {}

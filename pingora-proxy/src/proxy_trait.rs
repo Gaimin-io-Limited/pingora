@@ -21,6 +21,9 @@ use pingora_cache::{
 use proxy_cache::range_filter::{self};
 use std::time::Duration;
 
+#[cfg(feature = "forward")]
+use pingora_core::protocols::http::connect_tunnel::ConnectDestination;
+
 /// The interface to control the HTTP proxy
 ///
 /// The methods in [ProxyHttp] are filters/callbacks which will be performed on all requests at their
@@ -514,6 +517,51 @@ pub trait ProxyHttp {
         _purge_response: &mut std::borrow::Cow<'static, ResponseHeader>,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// This filter is called when the request is a CONNECT request.
+    #[cfg(feature = "forward")]
+    async fn connect_request_filter(
+        &self,
+        session: &mut Session,
+        destination: &ConnectDestination,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Box<HttpPeer>>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Default implementation rejects all CONNECT requests
+        Ok(None)
+    }
+
+    /// Called after CONNECT tunnel is successfully established
+    #[cfg(feature = "forward")]
+    async fn connect_tunnel_established(
+        &self,
+        _session: &mut Session,
+        _destination: &ConnectDestination,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
+    /// Called when CONNECT tunnel encounters an error or closes
+    #[cfg(feature = "forward")]
+    async fn connect_tunnel_closed(
+        &self,
+        _session: &mut Session,
+        _destination: &ConnectDestination,
+        _bytes_up: u64,
+        _bytes_down: u64,
+        _error: Option<&Error>,
+        _ctx: &mut Self::CTX,
+    ) where
+        Self::CTX: Send + Sync,
+    {
+        // Default implementation does nothing
     }
 }
 
