@@ -339,22 +339,18 @@ impl ProxyHttp for ExampleProxyHttp {
         session: &mut Session,
         destination: &pingora_core::protocols::http::connect_tunnel::ConnectDestination,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<Box<HttpPeer>>> {
+    ) -> Result<bool> {
         let req = session.req_header();
 
         if let Some(allow_header) = req.headers.get("x-connect-allow") {
             if let Ok(allowed_dest) = allow_header.to_str() {
                 if allowed_dest == destination.to_string() {
                     // Return a peer to connect to the destination
-                    return Ok(Some(Box::new(HttpPeer::new(
-                        destination.to_string(),
-                        false,
-                        "".to_string(),
-                    ))));
+                    return Ok(true);
                 }
             }
         }
-        Ok(None)
+        Ok(false)
     }
 
     #[cfg(feature = "forward")]

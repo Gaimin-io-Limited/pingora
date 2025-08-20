@@ -3,6 +3,7 @@ use crate::proxy_trait::ProxyHttp;
 use log::warn;
 use pingora_core::connectors::TransportConnector;
 use pingora_core::protocols::http::connect_tunnel::ConnectDestination;
+use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_core::upstreams::peer::BasicPeer;
 use pingora_error::{Error, Result};
 use pingora_http::ResponseHeader;
@@ -18,9 +19,10 @@ impl<SV> HttpProxy<SV> {
         SV: ProxyHttp + Send + Sync + 'static,
         SV::CTX: Send + Sync,
     {
+        debug!("Handling CONNECT request");
         // take ownership of the session but ensure it is mutable
         let mut session = session;
-        session.set_keepalive(None);
+        session.set_keepalive(Some(3));
 
         // for CONNECT requests through a proxy, the target destination is typically in the Host header
         // or in the URI path (e.g., CONNECT target.com:443 HTTP/1.1)
@@ -84,14 +86,19 @@ impl<SV> HttpProxy<SV> {
             }
         };
 
+        debug!("Parsed CONNECT destination: {}", destination);
+
         // call user filter to validate and get upstream peer
         match self
             .inner
             .connect_request_filter(&mut session, &destination, ctx)
             .await
         {
-            Ok(Some(peer)) => peer,
-            Ok(None) => {
+            Ok(true) => {
+                debug!("CONNECT request accepted by filter");
+            },
+            Ok(false) => {
+                debug!("CONNECT request rejected by filter");
                 // rejected by filter
                 return self
                     .handle_connect_error(
@@ -114,13 +121,35 @@ impl<SV> HttpProxy<SV> {
             }
         };
 
+        debug!("establishing connection to {}", destination.to_string().as_str());
+
         // establish raw TCP connection to upstream
-        // TODO(@siennathesane): figure out what configuration we care about here and how to expose it
-        let transport = TransportConnector::new(None);
-        let peer = BasicPeer::new(destination.to_string().as_str());
-        let mut upstream_stream = match transport.new_stream(&peer).await {
-            Ok(s) => s,
+        // TODO(@siennathesane): fix this with cloudflare/pingora#687
+        // TODO(@siennathesane): this will break with ipv6 addresses, need to handle that
+        let addr = match destination.to_string().parse() {
+            Ok(addr) => SocketAddr::Inet(addr),
             Err(e) => {
+                debug!("Failed to parse address: {}", e);
+                return self
+                    .handle_connect_error(
+                        &mut session,
+                        ctx,
+                        Error::e_explain(Custom("this is broken with IPv6. if using IPv4, try again"), e.to_string()),
+                        500,
+                    )
+                    .await;
+            }
+        };
+        debug!("parsed address to {}", addr.to_string().as_str());
+        let peer = BasicPeer::new(addr.to_string().as_str());
+
+        let transport = TransportConnector::new(Some(ConnectorOptions::new(1)));
+        let mut upstream_stream = match transport.new_stream(&peer).await {
+            Ok(s) => {
+                debug!("Successfully connected to upstream: {}", addr);
+                s },
+            Err(e) => {
+                debug!("failed to connect to upstream: {}", e);
                 return self
                     .handle_connect_error(
                         &mut session,
@@ -138,6 +167,7 @@ impl<SV> HttpProxy<SV> {
                 match resp.insert_header("Connection", "keep-alive") {
                     Ok(_) => {}
                     Err(_) => {
+                        debug!("Failed to insert Connection header");
                         return self
                             .handle_connect_error(
                                 &mut session,
@@ -161,6 +191,7 @@ impl<SV> HttpProxy<SV> {
                     .await;
             }
         };
+        debug!("Sending 200 Connection Established response to client");
 
         match session
             .write_response_header(Box::new(success_resp), false)
@@ -168,6 +199,7 @@ impl<SV> HttpProxy<SV> {
         {
             Ok(_) => {}
             Err(e) => {
+                debug!("Failed to write response header: {}", e);
                 return self
                     .handle_connect_error(
                         &mut session,
@@ -192,12 +224,16 @@ impl<SV> HttpProxy<SV> {
         let mut client_stream = match inner.finish().await {
             Ok(Some(stream)) => stream,
             Ok(None) => {
+                debug!("No client stream available, nothing to do");
                 return None; // No client stream available, nothing to do
             }
             Err(_) => {
+                debug!("Failed to finish session, no client stream available");
                 return None;
             }
         };
+
+        debug!("Client stream established, starting bidirectional copy");
 
         // TODO(@siennathesane): i'm not sure if the spec has anything about what to do on connection end
         match tokio::io::copy_bidirectional(&mut client_stream, &mut upstream_stream).await {

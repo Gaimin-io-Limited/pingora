@@ -523,15 +523,14 @@ pub trait ProxyHttp {
     #[cfg(feature = "forward")]
     async fn connect_request_filter(
         &self,
-        session: &mut Session,
-        destination: &ConnectDestination,
-        ctx: &mut Self::CTX,
-    ) -> Result<Option<Box<HttpPeer>>>
+        _session: &mut Session,
+        _destination: &ConnectDestination,
+        _ctx: &mut Self::CTX,
+    ) -> Result<bool>
     where
         Self::CTX: Send + Sync,
     {
-        // Default implementation rejects all CONNECT requests
-        Ok(None)
+        Ok(false)
     }
 
     /// Called after CONNECT tunnel is successfully established
