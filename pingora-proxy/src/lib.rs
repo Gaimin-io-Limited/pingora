@@ -72,6 +72,8 @@ const TASK_BUFFER_SIZE: usize = 4;
 
 mod proxy_cache;
 mod proxy_common;
+#[cfg(feature = "forward")]
+mod proxy_connect;
 mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
@@ -538,6 +540,14 @@ impl<SV> HttpProxy<SV> {
         }
 
         let req = session.downstream_session.req_header_mut();
+
+        // check if this is a CONNECT request
+        #[cfg(feature = "forward")]
+        if req.method == http::Method::CONNECT {
+            let _stream_result = self.handle_connect_request(session, &mut ctx).await;
+            // CONNECT requests don't support connection reuse
+            return None;
+        }
 
         // Built-in downstream request filters go first
         if let Err(e) = session

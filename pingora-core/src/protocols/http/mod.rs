@@ -19,6 +19,8 @@ pub mod bridge;
 pub mod client;
 pub mod compression;
 pub mod conditional_filter;
+#[cfg(feature = "forward")]
+pub mod connect_tunnel;
 pub(crate) mod date;
 pub mod error_resp;
 pub mod server;
